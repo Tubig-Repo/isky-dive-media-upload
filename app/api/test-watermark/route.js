@@ -4,10 +4,18 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { nanoid } from "nanoid";
+import { writeFile, readFile } from "fs/promises";
+import crypto from "crypto";
 
 export async function POST(req) {
   const data = await req.formData();
   const file = data.get("file");
+  const customerName = data.get("customerName");
+  const customerEmail = data.get("customerEmail");
+  const isPaid = data.get("isPaid") === "true";
+  const expiryDays = data.get("expiryDays");
+  const customMessage = data.get("customMessage");
+
   // Error Handling
   if (!file) {
     return Response.json({ error: "No file uploaded" }, { status: 400 });
@@ -22,11 +30,20 @@ export async function POST(req) {
   const inputPath = path.join(tempDir, `${videoId}-input.${fileExtension}`);
   const outputPath = path.join(tempDir, `${videoId}-output.${fileExtension}`);
 
-  // Path to your watermark image (adjust this path!)
+  // Optional: final storage location for the processed video
+  const uploadsDir = path.join(process.cwd(), "public", "uploads");
+  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+  const finalOutputPath = path.join(
+    uploadsDir,
+    `watermarked-${videoId}.${fileExtension}`
+  );
+
+  // Path to your watermark image
   const watermarkPath = path.join(process.cwd(), "public", "watermark.png");
 
   try {
-    // Check if watermark exists
+    // Check watermark
     if (!fs.existsSync(watermarkPath)) {
       return Response.json(
         {
@@ -38,89 +55,82 @@ export async function POST(req) {
       );
     }
 
-    // Write video to temp file
+    // Write input file
     fs.writeFileSync(inputPath, Buffer.from(arrayBuffer));
 
     console.log("Starting FFmpeg processing...");
-    console.log("Input:", inputPath);
-    console.log("Watermark:", watermarkPath);
-    console.log("Output:", outputPath);
 
-    // Apply watermark with FFmpeg
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .input(watermarkPath)
         .complexFilter([
-          // Scale watermark to desired size (optional - adjust or remove if not needed)
           "[1:v]scale=iw:ih[watermark]",
-          // Overlay in center using (W-w)/2 for horizontal and (H-h)/2 for vertical centering
-          // W/H = main video dimensions, w/h = watermark dimensions
           "[0:v][watermark]overlay=(W-w)/2:(H-h)/2",
         ])
-        .outputOptions([
-          "-c:v libx264", // Video codec
-          "-preset fast", // Encoding speed
-          "-crf 23", // Quality (lower = better, 18-28 range)
-          "-c:a copy", // Copy audio without re-encoding
-        ])
-        .output(outputPath)
-        .on("start", (commandLine) => {
-          console.log("FFmpeg command:", commandLine);
-        })
-        .on("progress", (progress) => {
-          console.log(`Processing: ${progress.percent}% done`);
-        })
-        .on("end", () => {
-          console.log("FFmpeg processing completed");
-          resolve();
-        })
-        .on("error", (err) => {
-          console.error("FFmpeg error:", err);
-          reject(err);
-        })
+        .outputOptions(["-c:v libx264", "-preset fast", "-crf 23", "-c:a copy"])
+        .output(finalOutputPath) // save directly to /public/uploads
+        .on("end", resolve)
+        .on("error", reject)
         .run();
     });
 
-    // Read the watermarked video
-    const watermarkedBuffer = fs.readFileSync(outputPath);
-    const stats = fs.statSync(outputPath);
+    console.log("FFmpeg processing completed:", finalOutputPath);
 
-    // Cleanup temp files
-    fs.unlinkSync(inputPath);
-    fs.unlinkSync(outputPath);
+    // ✅ Save submission data locally
+    // ✅ Ensure /data folder exists
+    const dataDir = path.join(process.cwd(), "data");
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
 
-    // Return the watermarked video as downloadable file
-    return new Response(watermarkedBuffer, {
-      headers: {
-        "Content-Type": "video/mp4",
-        "Content-Disposition": `attachment; filename="watermarked-${file.name}"`,
-        "Content-Length": stats.size.toString(),
-      },
+    const dataFile = path.join(dataDir, "submissions.json");
+    let existing = [];
+
+    try {
+      const raw = await readFile(dataFile, "utf8");
+      existing = JSON.parse(raw);
+    } catch (err) {
+      console.log("Creating new submissions.json...");
+    }
+    // ✅ Generate a unique customer URL
+    const customerToken = crypto.randomBytes(8).toString("hex");
+    const customerUrl = `localhost:3000/customer/${customerToken}`;
+
+    const newEntry = {
+      id: videoId,
+      token: customerToken,
+      customerUrl,
+      customerName,
+      customerEmail,
+      isPaid,
+      expiryDays,
+      customMessage,
+      videoPath: `/uploads/watermarked-${videoId}.${fileExtension}`,
+      createdAt: new Date().toISOString(),
+    };
+
+    existing.push(newEntry);
+    await writeFile(dataFile, JSON.stringify(existing, null, 2));
+
+    // ✅ Return the stored info (no need to return file blob anymore)
+    return Response.json({
+      success: true,
+      message: "Video processed and data saved locally",
+      data: newEntry,
     });
   } catch (error) {
-    // Cleanup on error
+    console.error("Processing failed:", error);
+    return Response.json(
+      { error: "Processing failed", details: error.message },
+      { status: 500 }
+    );
+  } finally {
+    // Clean temp files
     try {
       if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    } catch (cleanupError) {
-      console.error("Cleanup error:", cleanupError);
+    } catch (cleanupErr) {
+      console.warn("Temp cleanup failed:", cleanupErr);
     }
-
-    return Response.json(
-      {
-        error: "Processing failed",
-        details: error.message,
-        stack: error.stack,
-      },
-      { status: 500 }
-    );
   }
 }
-
-export const config = {
-  api: {
-    bodyParser: false,
-    responseLimit: "50mb",
-  },
-  maxDuration: 300, // 5 minutes
-};
